@@ -1,0 +1,122 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: uikit_db
+          POSTGRES_USER: uikit_user
+          POSTGRES_PASSWORD: uikit_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U uikit_user -d uikit_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://uikit_user:uikit_password@localhost:5432/uikit_db
+          REDIS_URL: redis://localhost:6379/0
+          SECRET_KEY: test-secret
+          GITHUB_CLIENT_ID: github
+          GITHUB_CLIENT_SECRET: github
+          GITHUB_REDIRECT_URI: http://localhost/callback
+          STRIPE_SECRET_KEY: sk_test
+          STRIPE_WEBHOOK_SECRET: whsec_test
+          STRIPE_PRO_MONTHLY_PRICE_ID: price1
+          STRIPE_PRO_ANNUAL_PRICE_ID: price2
+          STRIPE_TEAM_MONTHLY_PRICE_ID: price3
+          STRIPE_TEAM_ANNUAL_PRICE_ID: price4
+          SENDGRID_API_KEY: SG.test
+          FROM_EMAIL: ci@example.com
+          FROM_NAME: UIKit
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_S3_BUCKET: bucket
+          AWS_REGION: us-east-1
+          FRONTEND_URL: http://localhost:3000
+        run: |
+          cd backend
+          alembic upgrade head
+      - name: Run tests
+        run: |
+          cd backend
+          pytest tests/ --cov=app --cov-report=xml -v
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend/coverage.xml
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          cd backend
+          pip install -r requirements.txt
+          ruff check app/
+          mypy app/
+          black --check app/
+
+  build:
+    if: github.ref == 'refs/heads/main'
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/backend:latest
+            ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd /srv/componentlibrary/backend
+            docker pull ghcr.io/${{ github.repository }}/backend:latest
+            docker-compose -f docker-compose.prod.yml up -d --no-deps api
+            docker exec $(docker ps -qf "ancestor=ghcr.io/${{ github.repository }}/backend:latest" | head -n1) alembic upgrade head
+            curl -f https://api.yourdomain.com/health
